@@ -26,5 +26,6 @@ var (
 	ErrInsufficientBalance      = errors.New("insufficient balance for transfer")
 	ErrContractAddressCollision = errors.New("contract address collision")
 
-	ErrReadOnlyValueTransfer = errors.New("VM in read-only mode. Value transfer prohibited.")
+	ErrReadOnlyValueTransfer   = errors.New("VM in read-only mode. Value transfer prohibited.")
+	ErrNoCompatibleInterpreter = errors.New("no compatible interpreter")
 )

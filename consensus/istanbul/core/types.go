@@ -17,6 +17,7 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 
@@ -81,7 +82,7 @@ const (
 	msgPrepare
 	msgCommit
 	msgRoundChange
-	msgAll
+	// msgAll
 )
 
 type message struct {
@@ -137,10 +138,15 @@ func (m *message) FromPayload(b []byte, validateFn func([]byte, []byte) (common.
 			return err
 		}
 
-		_, err = validateFn(payload, m.Signature)
+		signerAdd, err := validateFn(payload, m.Signature)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(signerAdd.Bytes(), m.Address.Bytes()) {
+			return errInvalidSigner
+		}
 	}
-	// Still return the message even the err is not nil
-	return err
+	return nil
 }
 
 func (m *message) Payload() ([]byte, error) {

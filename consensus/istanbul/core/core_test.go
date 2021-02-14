@@ -17,11 +17,13 @@
 package core
 
 import (
+	"fmt"
 	"math/big"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	"github.com/ethereum/go-ethereum/core/types"
 	elog "github.com/ethereum/go-ethereum/log"
@@ -33,7 +35,7 @@ func makeBlock(number int64) *types.Block {
 		Number:     big.NewInt(number),
 		GasLimit:   0,
 		GasUsed:    0,
-		Time:       big.NewInt(0),
+		Time:       0,
 	}
 	block := &types.Block{}
 	return block.WithSeal(header)
@@ -57,16 +59,12 @@ func TestNewRequest(t *testing.T) {
 	request1 := makeBlock(1)
 	sys.backends[0].NewRequest(request1)
 
-	select {
-	case <-time.After(1 * time.Second):
-	}
+	<-time.After(1 * time.Second)
 
 	request2 := makeBlock(2)
 	sys.backends[0].NewRequest(request2)
 
-	select {
-	case <-time.After(1 * time.Second):
-	}
+	<-time.After(1 * time.Second)
 
 	for _, backend := range sys.backends {
 		if len(backend.committedMsgs) != 2 {
@@ -77,6 +75,23 @@ func TestNewRequest(t *testing.T) {
 		}
 		if !reflect.DeepEqual(request2.Number(), backend.committedMsgs[1].commitProposal.Number()) {
 			t.Errorf("the number of requests mismatch: have %v, want %v", request2.Number(), backend.committedMsgs[1].commitProposal.Number())
+		}
+	}
+}
+
+func TestQuorumSize(t *testing.T) {
+	N := uint64(4)
+	F := uint64(1)
+
+	sys := NewTestSystemWithBackend(N, F)
+	backend := sys.backends[0]
+	c := backend.engine.(*core)
+
+	valSet := c.valSet
+	for i := 1; i <= 1000; i++ {
+		valSet.AddValidator(common.StringToAddress(fmt.Sprint(i)))
+		if 2*c.QuorumSize() <= (valSet.Size()+valSet.F()) || 2*c.QuorumSize() > (valSet.Size()+valSet.F()+2) {
+			t.Errorf("quorumSize constraint failed, expected value (2*QuorumSize > Size+F && 2*QuorumSize <= Size+F+2) to be:%v, got: %v, for size: %v", true, false, valSet.Size())
 		}
 	}
 }

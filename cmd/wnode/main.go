@@ -37,11 +37,12 @@ import (
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/console"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
-	"github.com/ethereum/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/ethereum/go-ethereum/whisper/mailserver"
 	whisper "github.com/ethereum/go-ethereum/whisper/whisperv6"
@@ -165,7 +166,7 @@ func echo() {
 	fmt.Printf("pow = %f \n", *argPoW)
 	fmt.Printf("mspow = %f \n", *argServerPoW)
 	fmt.Printf("ip = %s \n", *argIP)
-	fmt.Printf("pub = %s \n", common.ToHex(crypto.FromECDSAPub(pub)))
+	fmt.Printf("pub = %s \n", hexutil.Encode(crypto.FromECDSAPub(pub)))
 	fmt.Printf("idfile = %s \n", *argIDFile)
 	fmt.Printf("dbpath = %s \n", *argDBPath)
 	fmt.Printf("boot = %s \n", *argEnode)
@@ -175,7 +176,7 @@ func initialize() {
 	log.Root().SetHandler(log.LvlFilterHandler(log.Lvl(*argVerbosity), log.StreamHandler(os.Stderr, log.TerminalFormat(false))))
 
 	done = make(chan struct{})
-	var peers []*discover.Node
+	var peers []*enode.Node
 	var err error
 
 	if *generateKey {
@@ -203,7 +204,7 @@ func initialize() {
 		if len(*argEnode) == 0 {
 			argEnode = scanLineA("Please enter the peer's enode: ")
 		}
-		peer := discover.MustParseNode(*argEnode)
+		peer := enode.MustParse(*argEnode)
 		peers = append(peers, peer)
 	}
 
@@ -298,7 +299,7 @@ func startServer() error {
 		return err
 	}
 
-	fmt.Printf("my public key: %s \n", common.ToHex(crypto.FromECDSAPub(&asymKey.PublicKey)))
+	fmt.Printf("my public key: %s \n", hexutil.Encode(crypto.FromECDSAPub(&asymKey.PublicKey)))
 	fmt.Println(server.NodeInfo().Enode)
 
 	if *bootstrapMode {
@@ -356,7 +357,7 @@ func configureNode() {
 		if len(symPass) == 0 {
 			symPass, err = console.Stdin.PromptPassword("Please enter the password for symmetric encryption: ")
 			if err != nil {
-				utils.Fatalf("Failed to read passphrase: %v", err)
+				utils.Fatalf("Failed to read password: %v", err)
 			}
 		}
 
@@ -598,6 +599,7 @@ func messageLoop() {
 	}
 
 	ticker := time.NewTicker(time.Millisecond * 50)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -747,14 +749,14 @@ func requestExpiredMessagesLoop() {
 }
 
 func extractIDFromEnode(s string) []byte {
-	n, err := discover.ParseNode(s)
+	n, err := enode.Parse(enode.ValidSchemes, s)
 	if err != nil {
-		utils.Fatalf("Failed to parse enode: %s", err)
+		utils.Fatalf("Failed to parse node: %s", err)
 	}
-	return n.ID[:]
+	return n.ID().Bytes()
 }
 
-// obfuscateBloom adds 16 random bits to the the bloom
+// obfuscateBloom adds 16 random bits to the bloom
 // filter, in order to obfuscate the containing topics.
 // it does so deterministically within every session.
 // despite additional bits, it will match on average

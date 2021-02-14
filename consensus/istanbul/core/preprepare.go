@@ -25,7 +25,6 @@ import (
 
 func (c *core) sendPreprepare(request *istanbul.Request) {
 	logger := c.logger.New("state", c.state)
-
 	// If I'm the proposer and I have the same sequence with the proposal
 	if c.current.Sequence().Cmp(request.Proposal.Number()) == 0 && c.IsProposer() {
 		curView := c.currentView()
@@ -37,7 +36,6 @@ func (c *core) sendPreprepare(request *istanbul.Request) {
 			logger.Error("Failed to encode", "view", curView)
 			return
 		}
-
 		c.broadcast(&message{
 			Code: msgPreprepare,
 			Msg:  preprepare,
@@ -82,9 +80,9 @@ func (c *core) handlePreprepare(msg *message, src istanbul.Validator) error {
 
 	// Verify the proposal we received
 	if duration, err := c.backend.Verify(preprepare.Proposal); err != nil {
-		logger.Warn("Failed to verify proposal", "err", err, "duration", duration)
 		// if it's a future block, we will handle it again after the duration
 		if err == consensus.ErrFutureBlock {
+			logger.Info("Proposed block will be handled in the future", "err", err, "duration", duration)
 			c.stopFuturePreprepareTimer()
 			c.futurePreprepareTimer = time.AfterFunc(duration, func() {
 				c.sendEvent(backlogEvent{
@@ -93,6 +91,7 @@ func (c *core) handlePreprepare(msg *message, src istanbul.Validator) error {
 				})
 			})
 		} else {
+			logger.Warn("Failed to verify proposal", "err", err, "duration", duration)
 			c.sendNextRoundChange()
 		}
 		return err

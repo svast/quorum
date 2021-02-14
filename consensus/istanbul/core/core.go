@@ -166,7 +166,7 @@ func (c *core) IsProposer() bool {
 }
 
 func (c *core) IsCurrentProposal(blockHash common.Hash) bool {
-	return c.current.pendingRequest != nil && c.current.pendingRequest.Proposal.Hash() == blockHash
+	return c.current != nil && c.current.pendingRequest != nil && c.current.pendingRequest.Proposal.Hash() == blockHash
 }
 
 func (c *core) commit() {
@@ -332,7 +332,6 @@ func (c *core) newRoundChangeTimer() {
 	if round > 0 {
 		timeout += time.Duration(math.Pow(2, float64(round))) * time.Second
 	}
-
 	c.roundChangeTimer = time.AfterFunc(timeout, func() {
 		c.sendEvent(timeoutEvent{})
 	})
@@ -340,6 +339,15 @@ func (c *core) newRoundChangeTimer() {
 
 func (c *core) checkValidatorSignature(data []byte, sig []byte) (common.Address, error) {
 	return istanbul.CheckValidatorSignature(c.valSet, data, sig)
+}
+
+func (c *core) QuorumSize() int {
+	if c.config.Ceil2Nby3Block == nil || (c.current != nil && c.current.sequence.Cmp(c.config.Ceil2Nby3Block) < 0) {
+		c.logger.Trace("Confirmation Formula used 2F+ 1")
+		return (2 * c.valSet.F()) + 1
+	}
+	c.logger.Trace("Confirmation Formula used ceil(2N/3)")
+	return int(math.Ceil(float64(2*c.valSet.Size()) / 3))
 }
 
 // PrepareCommittedSeal returns a committed seal for the given hash

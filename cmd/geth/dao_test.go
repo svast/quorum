@@ -25,7 +25,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -102,6 +101,7 @@ func TestDAOForkBlockNewChain(t *testing.T) {
 }
 
 func testDAOForkBlockNewChain(t *testing.T, test int, genesis string, expectBlock *big.Int, expectVote bool) {
+	defer SetResetPrivateConfig("ignore")()
 	// Create a temporary data directory to use and inspect later
 	datadir := tmpdir(t)
 	defer os.RemoveAll(datadir)
@@ -121,7 +121,7 @@ func testDAOForkBlockNewChain(t *testing.T, test int, genesis string, expectBloc
 	}
 	// Retrieve the DAO config flag from the database
 	path := filepath.Join(datadir, "geth", "chaindata")
-	db, err := ethdb.NewLDBDatabase(path, 0, 0)
+	db, err := rawdb.NewLevelDBDatabase(path, 0, 0, "")
 	if err != nil {
 		t.Fatalf("test %d: failed to open test database: %v", test, err)
 	}

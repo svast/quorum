@@ -70,7 +70,7 @@ const (
 	SHR
 	SAR
 
-	SHA3 = 0x20
+	SHA3 OpCode = 0x20
 )
 
 // 0x30 range - closure state.
@@ -90,6 +90,7 @@ const (
 	EXTCODECOPY
 	RETURNDATASIZE
 	RETURNDATACOPY
+	EXTCODEHASH
 )
 
 // 0x40 range - block operations.
@@ -100,6 +101,8 @@ const (
 	NUMBER
 	DIFFICULTY
 	GASLIMIT
+	CHAINID     OpCode = 0x46
+	SELFBALANCE OpCode = 0x47
 )
 
 // 0x50 range - 'storage' and execution.
@@ -209,10 +212,10 @@ const (
 	CALLCODE
 	RETURN
 	DELEGATECALL
-	STATICCALL = 0xfa
-
-	REVERT       = 0xfd
-	SELFDESTRUCT = 0xff
+	CREATE2
+	STATICCALL   OpCode = 0xfa
+	REVERT       OpCode = 0xfd
+	SELFDESTRUCT OpCode = 0xff
 )
 
 // Since the opcodes aren't all in order we can't use a regular slice.
@@ -266,14 +269,17 @@ var opCodeToString = map[OpCode]string{
 	EXTCODECOPY:    "EXTCODECOPY",
 	RETURNDATASIZE: "RETURNDATASIZE",
 	RETURNDATACOPY: "RETURNDATACOPY",
+	EXTCODEHASH:    "EXTCODEHASH",
 
 	// 0x40 range - block operations.
-	BLOCKHASH:  "BLOCKHASH",
-	COINBASE:   "COINBASE",
-	TIMESTAMP:  "TIMESTAMP",
-	NUMBER:     "NUMBER",
-	DIFFICULTY: "DIFFICULTY",
-	GASLIMIT:   "GASLIMIT",
+	BLOCKHASH:   "BLOCKHASH",
+	COINBASE:    "COINBASE",
+	TIMESTAMP:   "TIMESTAMP",
+	NUMBER:      "NUMBER",
+	DIFFICULTY:  "DIFFICULTY",
+	GASLIMIT:    "GASLIMIT",
+	CHAINID:     "CHAINID",
+	SELFBALANCE: "SELFBALANCE",
 
 	// 0x50 range - 'storage' and execution.
 	POP: "POP",
@@ -370,6 +376,7 @@ var opCodeToString = map[OpCode]string{
 	RETURN:       "RETURN",
 	CALLCODE:     "CALLCODE",
 	DELEGATECALL: "DELEGATECALL",
+	CREATE2:      "CREATE2",
 	STATICCALL:   "STATICCALL",
 	REVERT:       "REVERT",
 	SELFDESTRUCT: "SELFDESTRUCT",
@@ -424,6 +431,7 @@ var stringToOp = map[string]OpCode{
 	"CALLDATALOAD":   CALLDATALOAD,
 	"CALLDATASIZE":   CALLDATASIZE,
 	"CALLDATACOPY":   CALLDATACOPY,
+	"CHAINID":        CHAINID,
 	"DELEGATECALL":   DELEGATECALL,
 	"STATICCALL":     STATICCALL,
 	"CODESIZE":       CODESIZE,
@@ -433,12 +441,14 @@ var stringToOp = map[string]OpCode{
 	"EXTCODECOPY":    EXTCODECOPY,
 	"RETURNDATASIZE": RETURNDATASIZE,
 	"RETURNDATACOPY": RETURNDATACOPY,
+	"EXTCODEHASH":    EXTCODEHASH,
 	"BLOCKHASH":      BLOCKHASH,
 	"COINBASE":       COINBASE,
 	"TIMESTAMP":      TIMESTAMP,
 	"NUMBER":         NUMBER,
 	"DIFFICULTY":     DIFFICULTY,
 	"GASLIMIT":       GASLIMIT,
+	"SELFBALANCE":    SELFBALANCE,
 	"POP":            POP,
 	"MLOAD":          MLOAD,
 	"MSTORE":         MSTORE,
@@ -521,6 +531,7 @@ var stringToOp = map[string]OpCode{
 	"LOG3":           LOG3,
 	"LOG4":           LOG4,
 	"CREATE":         CREATE,
+	"CREATE2":        CREATE2,
 	"CALL":           CALL,
 	"RETURN":         RETURN,
 	"CALLCODE":       CALLCODE,
@@ -531,14 +542,4 @@ var stringToOp = map[string]OpCode{
 // StringToOp finds the opcode whose name is stored in `str`.
 func StringToOp(str string) OpCode {
 	return stringToOp[str]
-}
-
-func (op OpCode) isMutating() bool {
-	switch op {
-	// TODO(joel): REVERT?
-	case SELFDESTRUCT, CREATE, SSTORE, LOG0, LOG1, LOG2, LOG3, LOG4:
-		return true
-	default:
-		return false
-	}
 }

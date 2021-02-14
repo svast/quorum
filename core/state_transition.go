@@ -20,10 +20,14 @@ import (
 	"errors"
 	"math"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/multitenancy"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/private"
 )
@@ -36,7 +40,7 @@ var (
 The State Transitioning Model
 
 A state transition is a change made when a transaction is applied to the current world state
-The state transitioning model does all all the necessary work to work out a valid new state root.
+The state transitioning model does all the necessary work to work out a valid new state root.
 
 1) Nonce handling
 2) Pre pay gas
@@ -83,10 +87,10 @@ type PrivateMessage interface {
 }
 
 // IntrinsicGas computes the 'intrinsic gas' for a message with the given data.
-func IntrinsicGas(data []byte, contractCreation, homestead bool) (uint64, error) {
+func IntrinsicGas(data []byte, contractCreation, isHomestead bool, isEIP2028 bool) (uint64, error) {
 	// Set the starting gas for the raw transaction
 	var gas uint64
-	if contractCreation && homestead {
+	if contractCreation && isHomestead {
 		gas = params.TxGasContractCreation
 	} else {
 		gas = params.TxGas
@@ -101,10 +105,14 @@ func IntrinsicGas(data []byte, contractCreation, homestead bool) (uint64, error)
 			}
 		}
 		// Make sure we don't exceed uint64 for all data combinations
-		if (math.MaxUint64-gas)/params.TxDataNonZeroGas < nz {
+		nonZeroGas := params.TxDataNonZeroGasFrontier
+		if isEIP2028 {
+			nonZeroGas = params.TxDataNonZeroGasEIP2028
+		}
+		if (math.MaxUint64-gas)/nonZeroGas < nz {
 			return 0, vm.ErrOutOfGas
 		}
-		gas += nz * params.TxDataNonZeroGas
+		gas += nz * nonZeroGas
 
 		z := uint64(len(data)) - nz
 		if (math.MaxUint64-gas)/params.TxDataZeroGas < z {
@@ -186,8 +194,17 @@ func (st *StateTransition) preCheck() error {
 }
 
 // TransitionDb will transition the state by applying the current message and
-// returning the result including the the used gas. It returns an error if it
-// failed. An error indicates a consensus issue.
+// returning the result including the used gas. It returns an error if failed.
+// An error indicates a consensus issue.
+//
+// Quorum:
+// 1. Intrinsic gas is calculated based on the encrypted payload hash
+//    and NOT the actual private payload
+// 2. For private transactions, we only deduct intrinsic gas from the gas pool
+//    regardless the current node is party to the transaction or not
+// 3. With multitenancy support, we enforce the party set in the contract index must contain all
+//    parties from the transaction. This is to detect unauthorized access from a legit proxy contract
+//    to an unauthorized contract.
 func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) {
 	if err = st.preCheck(); err != nil {
 		return
@@ -195,15 +212,21 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 	msg := st.msg
 	sender := vm.AccountRef(msg.From())
 	homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
+	istanbul := st.evm.ChainConfig().IsIstanbul(st.evm.BlockNumber)
 	contractCreation := msg.To() == nil
 	isQuorum := st.evm.ChainConfig().IsQuorum
+	snapshot := st.evm.StateDB.Snapshot()
 
 	var data []byte
+	var managedPartiesInTx []string
 	isPrivate := false
 	publicState := st.state
+	pmh := newPMH(st)
 	if msg, ok := msg.(PrivateMessage); ok && isQuorum && msg.IsPrivate() {
 		isPrivate = true
-		data, err = private.P.Receive(st.data)
+		pmh.snapshot = snapshot
+		pmh.eph = common.BytesToEncryptedPayloadHash(st.data)
+		_, managedPartiesInTx, data, pmh.receivedPrivacyMetadata, err = private.P.Receive(pmh.eph)
 		// Increment the public account nonce if:
 		// 1. Tx is private and *not* a participant of the group and either call or create
 		// 2. Tx is private we are part of the group and is a call
@@ -214,6 +237,12 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 		if err != nil {
 			return nil, 0, false, nil
 		}
+
+		pmh.hasPrivatePayload = data != nil
+
+		if ok, err := pmh.prepare(); !ok {
+			return nil, 0, true, err
+		}
 	} else {
 		data = st.data
 	}
@@ -221,7 +250,7 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 	// Pay intrinsic gas. For a private contract this is done using the public hash passed in,
 	// not the private data retrieved above. This is because we need any (participant) validator
 	// node to get the same result as a (non-participant) minter node, to avoid out-of-gas issues.
-	gas, err := IntrinsicGas(st.data, contractCreation, homestead)
+	gas, err := IntrinsicGas(st.data, contractCreation, homestead, istanbul)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -231,7 +260,7 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 
 	var (
 		leftoverGas uint64
-		evm = st.evm
+		evm         = st.evm
 		// vm errors do not effect consensus and are therefor
 		// not assigned to err, except for insufficient balance
 		// error.
@@ -254,6 +283,8 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 		}
 		//if input is empty for the smart contract call, return
 		if len(data) == 0 && isPrivate {
+			st.refundGas()
+			st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
 			return nil, 0, false, nil
 		}
 
@@ -267,6 +298,42 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 		if vmerr == vm.ErrInsufficientBalance {
 			return nil, 0, false, vmerr
 		}
+		if errors.Is(vmerr, multitenancy.ErrNotAuthorized) {
+			return nil, 0, false, vmerr
+		}
+	}
+
+	// Quorum - Privacy Enhancements
+	// perform privacy enhancements checks
+	if pmh.mustVerify() {
+		var exitEarly bool
+		exitEarly, err = pmh.verify(vmerr)
+		if exitEarly {
+			return nil, 0, true, err
+		}
+	}
+	// End Quorum - Privacy Enhancements
+
+	// do the affected contract managed party checks
+	if msg, ok := msg.(PrivateMessage); ok && isQuorum && st.evm.SupportsMultitenancy && msg.IsPrivate() {
+		if len(managedPartiesInTx) > 0 {
+			for _, address := range evm.AffectedContracts() {
+				managedPartiesInContract, err := st.evm.StateDB.GetManagedParties(address)
+				if err != nil {
+					return nil, 0, true, err
+				}
+				// managed parties for public transactions is empty so nothing to check there
+				if len(managedPartiesInContract) > 0 {
+					if common.NotContainsAll(managedPartiesInContract, managedPartiesInTx) {
+						log.Debug("Managed parties check has failed for contract", "addr", address, "EPH",
+							pmh.eph.TerminalString(), "contractMP", managedPartiesInContract, "txMP", managedPartiesInTx)
+						st.evm.RevertToSnapshot(snapshot)
+						// TODO - see whether we can find a way to store this error and make it available via customizations to getTransactionReceipt
+						return nil, 0, true, nil
+					}
+				}
+			}
+		}
 	}
 
 	// Pay gas used during contract creation or execution (st.gas tracks remaining gas)
@@ -279,6 +346,19 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 
 	st.refundGas()
 	st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
+
+	// for all contracts being created as the result of the transaction execution
+	// we build the index for them if multitenancy is enabled
+	if st.evm.SupportsMultitenancy {
+		addresses := evm.CreatedContracts()
+		for _, address := range addresses {
+			log.Debug("Save to extra data",
+				"address", strings.ToLower(address.Hex()),
+				"isPrivate", isPrivate,
+				"parties", managedPartiesInTx)
+			st.evm.StateDB.SetManagedParties(address, managedPartiesInTx)
+		}
+	}
 
 	if isPrivate {
 		return ret, 0, vmerr != nil, err
@@ -307,3 +387,25 @@ func (st *StateTransition) refundGas() {
 func (st *StateTransition) gasUsed() uint64 {
 	return st.initialGas - st.gas
 }
+
+// Quorum - Privacy Enhancements - implement the pmcStateTransitionAPI interface
+func (st *StateTransition) SetTxPrivacyMetadata(pm *types.PrivacyMetadata) {
+	st.evm.SetTxPrivacyMetadata(pm)
+}
+func (st *StateTransition) IsPrivacyEnhancementsEnabled() bool {
+	return st.evm.ChainConfig().IsPrivacyEnhancementsEnabled(st.evm.BlockNumber)
+}
+func (st *StateTransition) RevertToSnapshot(snapshot int) {
+	st.evm.StateDB.RevertToSnapshot(snapshot)
+}
+func (st *StateTransition) GetStatePrivacyMetadata(addr common.Address) (*state.PrivacyMetadata, error) {
+	return st.evm.StateDB.GetPrivacyMetadata(addr)
+}
+func (st *StateTransition) CalculateMerkleRoot() (common.Hash, error) {
+	return st.evm.CalculateMerkleRoot()
+}
+func (st *StateTransition) AffectedContracts() []common.Address {
+	return st.evm.AffectedContracts()
+}
+
+// End Quorum - Privacy Enhancements

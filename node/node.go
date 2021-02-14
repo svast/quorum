@@ -17,6 +17,7 @@
 package node
 
 import (
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"net"
@@ -27,13 +28,16 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/debug"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/plugin"
+	"github.com/ethereum/go-ethereum/plugin/security"
 	"github.com/ethereum/go-ethereum/rpc"
-	"github.com/prometheus/prometheus/util/flock"
+	"github.com/prometheus/tsdb/fileutil"
 )
 
 // Node is a container on which services can be registered.
@@ -42,8 +46,8 @@ type Node struct {
 	config   *Config
 	accman   *accounts.Manager
 
-	ephemeralKeystore string         // if non-empty, the key directory that will be removed by Stop
-	instanceDirLock   flock.Releaser // prevents concurrent use of instance directory
+	ephemeralKeystore string            // if non-empty, the key directory that will be removed by Stop
+	instanceDirLock   fileutil.Releaser // prevents concurrent use of instance directory
 
 	serverConfig p2p.Config
 	server       *p2p.Server // Currently running P2P networking layer
@@ -58,14 +62,18 @@ type Node struct {
 	ipcListener net.Listener // IPC RPC listener socket to serve API requests
 	ipcHandler  *rpc.Server  // IPC RPC request handler to process the API requests
 
+	isHttps       bool
 	httpEndpoint  string       // HTTP endpoint (interface + port) to listen at (empty = HTTP disabled)
 	httpWhitelist []string     // HTTP RPC modules to allow through this endpoint
 	httpListener  net.Listener // HTTP RPC listener socket to server API requests
 	httpHandler   *rpc.Server  // HTTP RPC request handler to process the API requests
 
+	isWss      bool
 	wsEndpoint string       // Websocket endpoint (interface + port) to listen at (empty = websocket disabled)
 	wsListener net.Listener // Websocket RPC listener socket to server API requests
 	wsHandler  *rpc.Server  // Websocket RPC request handler to process the API requests
+
+	pluginManager *plugin.PluginManager // Manage all plugins for this node. If plugin is not enabled, an EmptyPluginManager is set.
 
 	stop chan struct{} // Channel to wait for termination notifications
 	lock sync.RWMutex
@@ -121,6 +129,29 @@ func New(conf *Config) (*Node, error) {
 	}, nil
 }
 
+// Close stops the Node and releases resources acquired in
+// Node constructor New.
+func (n *Node) Close() error {
+	var errs []error
+
+	// Terminate all subsystems and collect any errors
+	if err := n.Stop(); err != nil && err != ErrNodeStopped {
+		errs = append(errs, err)
+	}
+	if err := n.accman.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	// Report any errors that might have occurred
+	switch len(errs) {
+	case 0:
+		return nil
+	case 1:
+		return errs[0]
+	default:
+		return fmt.Errorf("%v", errs)
+	}
+}
+
 // Register injects a new service into the node's stack. The service created by
 // the passed constructor must be unique in its type with regard to sibling ones.
 func (n *Node) Register(constructor ServiceConstructor) error {
@@ -134,7 +165,7 @@ func (n *Node) Register(constructor ServiceConstructor) error {
 	return nil
 }
 
-// Start create a live P2P node and starts running it.
+// Start creates a live P2P node and starts running it.
 func (n *Node) Start() error {
 	n.lock.Lock()
 	defer n.lock.Unlock()
@@ -169,10 +200,11 @@ func (n *Node) Start() error {
 
 	// Otherwise copy and specialize the P2P configuration
 	services := make(map[reflect.Type]Service)
+	var kinds []reflect.Type
 	for _, constructor := range n.serviceFuncs {
 		// Create a new context for the particular service
 		ctx := &ServiceContext{
-			config:         n.config,
+			Config:         *n.config,
 			services:       make(map[reflect.Type]Service),
 			EventMux:       n.eventmux,
 			AccountManager: n.accman,
@@ -190,6 +222,8 @@ func (n *Node) Start() error {
 			return &DuplicateServiceError{Kind: kind}
 		}
 		services[kind] = service
+		// to keep track of order in which services are constructed
+		kinds = append(kinds, kind)
 	}
 	// Gather the protocols and start the freshly assembled P2P server
 	for _, service := range services {
@@ -199,8 +233,10 @@ func (n *Node) Start() error {
 		return convertFileLockError(err)
 	}
 	// Start each of the services
-	started := []reflect.Type{}
-	for kind, service := range services {
+	var started []reflect.Type
+	// start services in the same order that they are constructed
+	for _, kind := range kinds {
+		service := services[kind]
 		// Start the next service, stopping all previous upon failure
 		if err := service.Start(running); err != nil {
 			for _, kind := range started {
@@ -213,7 +249,13 @@ func (n *Node) Start() error {
 		// Mark the service started for potential cleanup
 		started = append(started, kind)
 	}
-	// Lastly start the configured RPC interfaces
+	// Retrieve PluginManager service if configured
+	if pm, hasPluginManager := services[reflect.TypeOf(&plugin.PluginManager{})]; hasPluginManager {
+		n.pluginManager = pm.(*plugin.PluginManager)
+	} else {
+		n.pluginManager = plugin.NewEmptyPluginManager()
+	}
+	// Lastly, start the configured RPC interfaces
 	if err := n.startRPC(services); err != nil {
 		for _, service := range services {
 			service.Stop()
@@ -225,8 +267,12 @@ func (n *Node) Start() error {
 	n.services = services
 	n.server = running
 	n.stop = make(chan struct{})
-
 	return nil
+}
+
+// Config returns the configuration of node.
+func (n *Node) Config() *Config {
+	return n.config
 }
 
 func (n *Node) openDataDir() error {
@@ -240,7 +286,7 @@ func (n *Node) openDataDir() error {
 	}
 	// Lock the instance directory to prevent concurrent use by another instance as well as
 	// accidental use of the instance directory as a database.
-	release, _, err := flock.New(filepath.Join(instdir, "LOCK"))
+	release, _, err := fileutil.Flock(filepath.Join(instdir, "LOCK"))
 	if err != nil {
 		return convertFileLockError(err)
 	}
@@ -248,7 +294,7 @@ func (n *Node) openDataDir() error {
 	return nil
 }
 
-// startRPC is a helper method to start all the various RPC endpoint during node
+// startRPC is a helper method to start all the various RPC endpoints during node
 // startup. It's not meant to be called at any time afterwards as it makes certain
 // assumptions about the state of the node.
 func (n *Node) startRPC(services map[reflect.Type]Service) error {
@@ -265,17 +311,21 @@ func (n *Node) startRPC(services map[reflect.Type]Service) error {
 		n.stopInProc()
 		return err
 	}
-	if err := n.startHTTP(n.httpEndpoint, apis, n.config.HTTPModules, n.config.HTTPCors, n.config.HTTPVirtualHosts); err != nil {
+	if err := n.startHTTP(n.httpEndpoint, apis, n.config.HTTPModules, n.config.HTTPCors, n.config.HTTPVirtualHosts, n.config.HTTPTimeouts, n.config.WSOrigins); err != nil {
 		n.stopIPC()
 		n.stopInProc()
 		return err
 	}
-	if err := n.startWS(n.wsEndpoint, apis, n.config.WSModules, n.config.WSOrigins, n.config.WSExposeAll); err != nil {
-		n.stopHTTP()
-		n.stopIPC()
-		n.stopInProc()
-		return err
+	// if endpoints are not the same, start separate servers
+	if n.httpEndpoint != n.wsEndpoint {
+		if err := n.startWS(n.wsEndpoint, apis, n.config.WSModules, n.config.WSOrigins, n.config.WSExposeAll); err != nil {
+			n.stopHTTP()
+			n.stopIPC()
+			n.stopInProc()
+			return err
+		}
 	}
+
 	// All API endpoints started successfully
 	n.rpcAPIs = apis
 	return nil
@@ -289,10 +339,10 @@ func (n *Node) startInProc(apis []rpc.API) error {
 		if err := handler.RegisterName(api.Namespace, api.Service); err != nil {
 			return err
 		}
-		n.log.Debug("InProc registered", "service", api.Service, "namespace", api.Namespace)
+		n.log.Debug("InProc registered", "namespace", api.Namespace)
 	}
 	n.inprocHandler = handler
-	return nil
+	return n.eventmux.Post(rpc.InProcServerReadyEvent{})
 }
 
 // stopInProc terminates the in-process RPC endpoint.
@@ -324,7 +374,7 @@ func (n *Node) stopIPC() {
 		n.ipcListener.Close()
 		n.ipcListener = nil
 
-		n.log.Info("IPC endpoint closed", "endpoint", n.ipcEndpoint)
+		n.log.Info("IPC endpoint closed", "url", n.ipcEndpoint)
 	}
 	if n.ipcHandler != nil {
 		n.ipcHandler.Stop()
@@ -332,21 +382,74 @@ func (n *Node) stopIPC() {
 	}
 }
 
+func (n *Node) httpScheme() string {
+	if n.isHttps {
+		return "https"
+	}
+	return "http"
+}
+
+func (n *Node) wsScheme() string {
+	if n.isWss {
+		return "wss"
+	}
+	return "ws"
+}
+
+func (n *Node) getSecuritySupports() (tlsConfigSource security.TLSConfigurationSource, authManager security.AuthenticationManager, err error) {
+	if n.pluginManager.IsEnabled(plugin.SecurityPluginInterfaceName) {
+		sp := new(plugin.SecurityPluginTemplate)
+		if err = n.pluginManager.GetPluginTemplate(plugin.SecurityPluginInterfaceName, sp); err != nil {
+			return
+		}
+		if tlsConfigSource, err = sp.TLSConfigurationSource(); err != nil {
+			return
+		}
+		if authManager, err = sp.AuthenticationManager(); err != nil {
+			return
+		}
+	} else {
+		log.Info("Security Plugin is not enabled")
+	}
+	return
+}
+
 // startHTTP initializes and starts the HTTP RPC endpoint.
-func (n *Node) startHTTP(endpoint string, apis []rpc.API, modules []string, cors []string, vhosts []string) error {
+func (n *Node) startHTTP(endpoint string, apis []rpc.API, modules []string, cors []string, vhosts []string, timeouts rpc.HTTPTimeouts, wsOrigins []string) error {
 	// Short circuit if the HTTP endpoint isn't being exposed
 	if endpoint == "" {
 		return nil
 	}
-	listener, handler, err := rpc.StartHTTPEndpoint(endpoint, apis, modules, cors, vhosts)
+	tlsConfigSource, authManager, err := n.getSecuritySupports()
 	if err != nil {
 		return err
 	}
-	n.log.Info("HTTP endpoint opened", "url", fmt.Sprintf("http://%s", endpoint), "cors", strings.Join(cors, ","), "vhosts", strings.Join(vhosts, ","))
+	// register apis and create handler stack
+	srv := rpc.NewProtectedServer(authManager)
+	err = RegisterApisFromWhitelist(apis, modules, srv, false)
+	if err != nil {
+		return err
+	}
+	handler := NewHTTPHandlerStack(srv, cors, vhosts)
+	// wrap handler in websocket handler only if websocket port is the same as http rpc
+	if n.httpEndpoint == n.wsEndpoint {
+		handler = NewWebsocketUpgradeHandler(handler, srv.WebsocketHandler(wsOrigins))
+	}
+	listener, isTlsEnabled, err := StartHTTPEndpoint(endpoint, timeouts, handler, tlsConfigSource)
+	if err != nil {
+		return err
+	}
+	n.isHttps = isTlsEnabled
+	n.log.Info("HTTP endpoint opened", "url", fmt.Sprintf("http://%v/", listener.Addr()),
+		"cors", strings.Join(cors, ","),
+		"vhosts", strings.Join(vhosts, ","))
+	if n.httpEndpoint == n.wsEndpoint {
+		n.log.Info("WebSocket endpoint opened", "url", fmt.Sprintf("ws://%v", listener.Addr()))
+	}
 	// All listeners booted successfully
 	n.httpEndpoint = endpoint
 	n.httpListener = listener
-	n.httpHandler = handler
+	n.httpHandler = srv
 
 	return nil
 }
@@ -354,10 +457,10 @@ func (n *Node) startHTTP(endpoint string, apis []rpc.API, modules []string, cors
 // stopHTTP terminates the HTTP RPC endpoint.
 func (n *Node) stopHTTP() {
 	if n.httpListener != nil {
+		url := fmt.Sprintf("http://%v/", n.httpListener.Addr())
 		n.httpListener.Close()
 		n.httpListener = nil
-
-		n.log.Info("HTTP endpoint closed", "url", fmt.Sprintf("http://%s", n.httpEndpoint))
+		n.log.Info("HTTP endpoint closed", "url", url)
 	}
 	if n.httpHandler != nil {
 		n.httpHandler.Stop()
@@ -371,15 +474,26 @@ func (n *Node) startWS(endpoint string, apis []rpc.API, modules []string, wsOrig
 	if endpoint == "" {
 		return nil
 	}
-	listener, handler, err := rpc.StartWSEndpoint(endpoint, apis, modules, wsOrigins, exposeAll)
+	tlsConfigSource, authManager, err := n.getSecuritySupports()
 	if err != nil {
 		return err
 	}
+	srv := rpc.NewProtectedServer(authManager)
+	handler := srv.WebsocketHandler(wsOrigins)
+	err = RegisterApisFromWhitelist(apis, modules, srv, exposeAll)
+	if err != nil {
+		return err
+	}
+	listener, isTlsEnabled, err := startWSEndpoint(endpoint, handler, tlsConfigSource)
+	if err != nil {
+		return err
+	}
+	n.isWss = isTlsEnabled
 	n.log.Info("WebSocket endpoint opened", "url", fmt.Sprintf("ws://%s", listener.Addr()))
 	// All listeners booted successfully
 	n.wsEndpoint = endpoint
 	n.wsListener = listener
-	n.wsHandler = handler
+	n.wsHandler = srv
 
 	return nil
 }
@@ -390,7 +504,7 @@ func (n *Node) stopWS() {
 		n.wsListener.Close()
 		n.wsListener = nil
 
-		n.log.Info("WebSocket endpoint closed", "url", fmt.Sprintf("ws://%s", n.wsEndpoint))
+		n.log.Info("WebSocket endpoint closed", "url", fmt.Sprintf("%s://%s", n.wsScheme(), n.wsEndpoint))
 	}
 	if n.wsHandler != nil {
 		n.wsHandler.Stop()
@@ -528,6 +642,20 @@ func (n *Node) Service(service interface{}) error {
 	return ErrServiceUnknown
 }
 
+// Quorum
+//
+// delegate call to node.Config
+func (n *Node) IsPermissionEnabled() bool {
+	return n.config.IsPermissionEnabled()
+}
+
+// Quorum
+//
+// delegate call to node.Config
+func (n *Node) GetNodeKey() *ecdsa.PrivateKey {
+	return n.config.NodeKey()
+}
+
 // DataDir retrieves the current datadir used by the protocol stack.
 // Deprecated: No files should be stored in this directory, use InstanceDir instead.
 func (n *Node) DataDir() string {
@@ -551,11 +679,23 @@ func (n *Node) IPCEndpoint() string {
 
 // HTTPEndpoint retrieves the current HTTP endpoint used by the protocol stack.
 func (n *Node) HTTPEndpoint() string {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+
+	if n.httpListener != nil {
+		return n.httpListener.Addr().String()
+	}
 	return n.httpEndpoint
 }
 
 // WSEndpoint retrieves the current WS endpoint used by the protocol stack.
 func (n *Node) WSEndpoint() string {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+
+	if n.wsListener != nil {
+		return n.wsListener.Addr().String()
+	}
 	return n.wsEndpoint
 }
 
@@ -568,16 +708,36 @@ func (n *Node) EventMux() *event.TypeMux {
 // OpenDatabase opens an existing database with the given name (or creates one if no
 // previous can be found) from within the node's instance directory. If the node is
 // ephemeral, a memory database is returned.
-func (n *Node) OpenDatabase(name string, cache, handles int) (ethdb.Database, error) {
+func (n *Node) OpenDatabase(name string, cache, handles int, namespace string) (ethdb.Database, error) {
 	if n.config.DataDir == "" {
-		return ethdb.NewMemDatabase(), nil
+		return rawdb.NewMemoryDatabase(), nil
 	}
-	return ethdb.NewLDBDatabase(n.config.resolvePath(name), cache, handles)
+	return rawdb.NewLevelDBDatabase(n.config.ResolvePath(name), cache, handles, namespace)
+}
+
+// OpenDatabaseWithFreezer opens an existing database with the given name (or
+// creates one if no previous can be found) from within the node's data directory,
+// also attaching a chain freezer to it that moves ancient chain data from the
+// database to immutable append-only files. If the node is an ephemeral one, a
+// memory database is returned.
+func (n *Node) OpenDatabaseWithFreezer(name string, cache, handles int, freezer, namespace string) (ethdb.Database, error) {
+	if n.config.DataDir == "" {
+		return rawdb.NewMemoryDatabase(), nil
+	}
+	root := n.config.ResolvePath(name)
+
+	switch {
+	case freezer == "":
+		freezer = filepath.Join(root, "ancient")
+	case !filepath.IsAbs(freezer):
+		freezer = n.config.ResolvePath(freezer)
+	}
+	return rawdb.NewLevelDBDatabaseWithFreezer(root, cache, handles, freezer, namespace)
 }
 
 // ResolvePath returns the absolute path of a resource in the instance directory.
 func (n *Node) ResolvePath(x string) string {
-	return n.config.resolvePath(x)
+	return n.config.ResolvePath(x)
 }
 
 // apis returns the collection of RPC descriptors this node offers.
@@ -597,15 +757,42 @@ func (n *Node) apis() []rpc.API {
 			Version:   "1.0",
 			Service:   debug.Handler,
 		}, {
-			Namespace: "debug",
-			Version:   "1.0",
-			Service:   NewPublicDebugAPI(n),
-			Public:    true,
-		}, {
 			Namespace: "web3",
 			Version:   "1.0",
 			Service:   NewPublicWeb3API(n),
 			Public:    true,
 		},
 	}
+}
+
+// RegisterApisFromWhitelist checks the given modules' availability, generates a whitelist based on the allowed modules,
+// and then registers all of the APIs exposed by the services.
+func RegisterApisFromWhitelist(apis []rpc.API, modules []string, srv *rpc.Server, exposeAll bool) error {
+	if bad, available := checkModuleAvailability(modules, apis); len(bad) > 0 {
+		log.Error("Unavailable modules in HTTP API list", "unavailable", bad, "available", available)
+	}
+	// Generate the whitelist based on the allowed modules
+	whitelist := make(map[string]bool)
+	for _, module := range modules {
+		whitelist[module] = true
+	}
+	// Register all the APIs exposed by the services
+	for _, api := range apis {
+		if exposeAll || whitelist[api.Namespace] || (len(whitelist) == 0 && api.Public) {
+			if err := srv.RegisterName(api.Namespace, api.Service); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Quorum
+//
+// This can be used to inspect plugins used in the current node
+func (n *Node) PluginManager() *plugin.PluginManager {
+	n.lock.RLock()
+	defer n.lock.RUnlock()
+
+	return n.pluginManager
 }

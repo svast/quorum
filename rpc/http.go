@@ -25,45 +25,93 @@ import (
 	"io"
 	"io/ioutil"
 	"mime"
-	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/rs/cors"
+	"github.com/ethereum/go-ethereum/log"
 )
 
 const (
+	maxRequestContentLength = 1024 * 1024 * 5
 	contentType             = "application/json"
-	maxRequestContentLength = 1024 * 128
 )
 
-var nullAddr, _ = net.ResolveTCPAddr("tcp", "127.0.0.1:0")
+// https://www.jsonrpc.org/historical/json-rpc-over-http.html#id13
+var acceptedContentTypes = []string{contentType, "application/json-rpc", "application/jsonrequest"}
 
 type httpConn struct {
 	client    *http.Client
 	req       *http.Request
 	closeOnce sync.Once
-	closed    chan struct{}
+	closeCh   chan interface{}
+
+	// Quorum
+	// To return value being populated in Authorization request header
+	credentialsProvider HttpCredentialsProviderFunc
 }
 
 // httpConn is treated specially by Client.
-func (hc *httpConn) LocalAddr() net.Addr              { return nullAddr }
-func (hc *httpConn) RemoteAddr() net.Addr             { return nullAddr }
-func (hc *httpConn) SetReadDeadline(time.Time) error  { return nil }
-func (hc *httpConn) SetWriteDeadline(time.Time) error { return nil }
-func (hc *httpConn) SetDeadline(time.Time) error      { return nil }
-func (hc *httpConn) Write([]byte) (int, error)        { panic("Write called") }
-
-func (hc *httpConn) Read(b []byte) (int, error) {
-	<-hc.closed
-	return 0, io.EOF
+func (hc *httpConn) writeJSON(context.Context, interface{}) error {
+	panic("writeJSON called on httpConn")
 }
 
-func (hc *httpConn) Close() error {
-	hc.closeOnce.Do(func() { close(hc.closed) })
-	return nil
+func (hc *httpConn) remoteAddr() string {
+	return hc.req.URL.String()
+}
+
+func (hc *httpConn) readBatch() ([]*jsonrpcMessage, bool, error) {
+	<-hc.closeCh
+	return nil, false, io.EOF
+}
+
+func (hc *httpConn) close() {
+	hc.closeOnce.Do(func() { close(hc.closeCh) })
+}
+
+func (hc *httpConn) closed() <-chan interface{} {
+	return hc.closeCh
+}
+
+func (hc *httpConn) Configure(_ securityContext) {
+	// Client doesn't need to implement this
+}
+
+func (hc *httpConn) Resolve() securityContext {
+	// Client doesn't need to implement this
+	return context.Background()
+}
+
+// HTTPTimeouts represents the configuration params for the HTTP RPC server.
+type HTTPTimeouts struct {
+	// ReadTimeout is the maximum duration for reading the entire
+	// request, including the body.
+	//
+	// Because ReadTimeout does not let Handlers make per-request
+	// decisions on each request body's acceptable deadline or
+	// upload rate, most users will prefer to use
+	// ReadHeaderTimeout. It is valid to use them both.
+	ReadTimeout time.Duration
+
+	// WriteTimeout is the maximum duration before timing out
+	// writes of the response. It is reset whenever a new
+	// request's header is read. Like ReadTimeout, it does not
+	// let Handlers make decisions on a per-request basis.
+	WriteTimeout time.Duration
+
+	// IdleTimeout is the maximum amount of time to wait for the
+	// next request when keep-alives are enabled. If IdleTimeout
+	// is zero, the value of ReadTimeout is used. If both are
+	// zero, ReadHeaderTimeout is used.
+	IdleTimeout time.Duration
+}
+
+// DefaultHTTPTimeouts represents the default timeout values used if further
+// configuration is not provided.
+var DefaultHTTPTimeouts = HTTPTimeouts{
+	ReadTimeout:  30 * time.Second,
+	WriteTimeout: 30 * time.Second,
+	IdleTimeout:  120 * time.Second,
 }
 
 // DialHTTPWithClient creates a new RPC client that connects to an RPC server over HTTP
@@ -77,8 +125,8 @@ func DialHTTPWithClient(endpoint string, client *http.Client) (*Client, error) {
 	req.Header.Set("Accept", contentType)
 
 	initctx := context.Background()
-	return newClient(initctx, func(context.Context) (net.Conn, error) {
-		return &httpConn{client: client, req: req, closed: make(chan struct{})}, nil
+	return newClient(initctx, func(context.Context) (ServerCodec, error) {
+		return &httpConn{client: client, req: req, closeCh: make(chan interface{})}, nil
 	})
 }
 
@@ -128,6 +176,10 @@ func (c *Client) sendBatchHTTP(ctx context.Context, op *requestOp, msgs []*jsonr
 	return nil
 }
 
+// Quorum
+//
+// Populate Authorization request header with value from credentials provider
+// Ignore if provider is unable to return the value
 func (hc *httpConn) doRequest(ctx context.Context, msg interface{}) (io.ReadCloser, error) {
 	body, err := json.Marshal(msg)
 	if err != nil {
@@ -136,7 +188,13 @@ func (hc *httpConn) doRequest(ctx context.Context, msg interface{}) (io.ReadClos
 	req := hc.req.WithContext(ctx)
 	req.Body = ioutil.NopCloser(bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
-
+	if hc.credentialsProvider != nil {
+		if token, err := hc.credentialsProvider(ctx); err != nil {
+			log.Warn("unable to obtain http credentials from provider", "err", err)
+		} else {
+			req.Header.Set(HttpAuthorizationHeader, token)
+		}
+	}
 	resp, err := hc.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -147,34 +205,32 @@ func (hc *httpConn) doRequest(ctx context.Context, msg interface{}) (io.ReadClos
 	return resp.Body, nil
 }
 
-// httpReadWriteNopCloser wraps a io.Reader and io.Writer with a NOP Close method.
-type httpReadWriteNopCloser struct {
+// httpServerConn turns a HTTP connection into a Conn.
+type httpServerConn struct {
 	io.Reader
 	io.Writer
+	r *http.Request
 }
 
-// Close does nothing and returns always nil
-func (t *httpReadWriteNopCloser) Close() error {
-	return nil
+func newHTTPServerConn(r *http.Request, w http.ResponseWriter) ServerCodec {
+	body := io.LimitReader(r.Body, maxRequestContentLength)
+	conn := &httpServerConn{Reader: body, Writer: w, r: r}
+	return NewCodec(conn)
 }
 
-// NewHTTPServer creates a new HTTP RPC server around an API provider.
-//
-// Deprecated: Server implements http.Handler
-func NewHTTPServer(cors []string, vhosts []string, srv *Server) *http.Server {
-	// Wrap the CORS-handler within a host-handler
-	handler := newCorsHandler(srv, cors)
-	handler = newVHostHandler(vhosts, handler)
-	return &http.Server{
-		Handler:      handler,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
+// Close does nothing and always returns nil.
+func (t *httpServerConn) Close() error { return nil }
+
+// RemoteAddr returns the peer address of the underlying connection.
+func (t *httpServerConn) RemoteAddr() string {
+	return t.r.RemoteAddr
 }
+
+// SetWriteDeadline does nothing and always returns nil.
+func (t *httpServerConn) SetWriteDeadline(time.Time) error { return nil }
 
 // ServeHTTP serves JSON-RPC requests over HTTP.
-func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Permit dumb empty requests for remote health-checks (AWS)
 	if r.Method == http.MethodGet && r.ContentLength == 0 && r.URL.RawQuery == "" {
 		return
@@ -183,20 +239,24 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), code)
 		return
 	}
-	// All checks passed, create a codec that reads direct from the request body
-	// untilEOF and writes the response to w and order the server to process a
+	// All checks passed, create a codec that reads directly from the request body
+	// until EOF, writes the response to w, and orders the server to process a
 	// single request.
 	ctx := r.Context()
 	ctx = context.WithValue(ctx, "remote", r.RemoteAddr)
 	ctx = context.WithValue(ctx, "scheme", r.Proto)
 	ctx = context.WithValue(ctx, "local", r.Host)
-
-	body := io.LimitReader(r.Body, maxRequestContentLength)
-	codec := NewJSONCodec(&httpReadWriteNopCloser{body, w})
-	defer codec.Close()
-
+	if ua := r.Header.Get("User-Agent"); ua != "" {
+		ctx = context.WithValue(ctx, "User-Agent", ua)
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		ctx = context.WithValue(ctx, "Origin", origin)
+	}
 	w.Header().Set("content-type", contentType)
-	srv.ServeSingleRequest(ctx, codec, OptionMethodInvocation)
+	codec := newHTTPServerConn(r, w)
+	defer codec.close()
+	s.authenticateHttpRequest(r, codec)
+	s.serveSingleRequest(ctx, codec)
 }
 
 // validateRequest returns a non-zero response code and error message if the
@@ -209,71 +269,19 @@ func validateRequest(r *http.Request) (int, error) {
 		err := fmt.Errorf("content length too large (%d>%d)", r.ContentLength, maxRequestContentLength)
 		return http.StatusRequestEntityTooLarge, err
 	}
-	mt, _, err := mime.ParseMediaType(r.Header.Get("content-type"))
-	if r.Method != http.MethodOptions && (err != nil || mt != contentType) {
-		err := fmt.Errorf("invalid content type, only %s is supported", contentType)
-		return http.StatusUnsupportedMediaType, err
+	// Allow OPTIONS (regardless of content-type)
+	if r.Method == http.MethodOptions {
+		return 0, nil
 	}
-	return 0, nil
-}
-
-func newCorsHandler(srv *Server, allowedOrigins []string) http.Handler {
-	// disable CORS support if user has not specified a custom CORS configuration
-	if len(allowedOrigins) == 0 {
-		return srv
+	// Check content-type
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("content-type")); err == nil {
+		for _, accepted := range acceptedContentTypes {
+			if accepted == mt {
+				return 0, nil
+			}
+		}
 	}
-	c := cors.New(cors.Options{
-		AllowedOrigins: allowedOrigins,
-		AllowedMethods: []string{http.MethodPost, http.MethodGet},
-		MaxAge:         600,
-		AllowedHeaders: []string{"*"},
-	})
-	return c.Handler(srv)
-}
-
-// virtualHostHandler is a handler which validates the Host-header of incoming requests.
-// The virtualHostHandler can prevent DNS rebinding attacks, which do not utilize CORS-headers,
-// since they do in-domain requests against the RPC api. Instead, we can see on the Host-header
-// which domain was used, and validate that against a whitelist.
-type virtualHostHandler struct {
-	vhosts map[string]struct{}
-	next   http.Handler
-}
-
-// ServeHTTP serves JSON-RPC requests over HTTP, implements http.Handler
-func (h *virtualHostHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// if r.Host is not set, we can continue serving since a browser would set the Host header
-	if r.Host == "" {
-		h.next.ServeHTTP(w, r)
-		return
-	}
-	host, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		// Either invalid (too many colons) or no port specified
-		host = r.Host
-	}
-	if ipAddr := net.ParseIP(host); ipAddr != nil {
-		// It's an IP address, we can serve that
-		h.next.ServeHTTP(w, r)
-		return
-
-	}
-	// Not an ip address, but a hostname. Need to validate
-	if _, exist := h.vhosts["*"]; exist {
-		h.next.ServeHTTP(w, r)
-		return
-	}
-	if _, exist := h.vhosts[host]; exist {
-		h.next.ServeHTTP(w, r)
-		return
-	}
-	http.Error(w, "invalid host specified", http.StatusForbidden)
-}
-
-func newVHostHandler(vhosts []string, next http.Handler) http.Handler {
-	vhostMap := make(map[string]struct{})
-	for _, allowedHost := range vhosts {
-		vhostMap[strings.ToLower(allowedHost)] = struct{}{}
-	}
-	return &virtualHostHandler{vhostMap, next}
+	// Invalid content-type
+	err := fmt.Errorf("invalid content type, only %s is supported", contentType)
+	return http.StatusUnsupportedMediaType, err
 }

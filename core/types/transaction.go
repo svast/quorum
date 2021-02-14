@@ -19,6 +19,7 @@ package types
 import (
 	"container/heap"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"sync/atomic"
@@ -26,8 +27,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/private/engine"
 	"github.com/ethereum/go-ethereum/rlp"
-	fmt "fmt"
 )
 
 //go:generate gencodec -type txdata -field-override txdataMarshaling -out gen_tx_json.go
@@ -41,6 +43,8 @@ func deriveSigner(V *big.Int) Signer {
 	// joel: this is one of the two places we used a wrong signer to print txes
 	if V.Sign() != 0 && isProtectedV(V) {
 		return NewEIP155Signer(deriveChainId(V))
+	} else if isPrivate(V) {
+		return QuorumPrivateTxSigner{}
 	} else {
 		return HomesteadSigner{}
 	}
@@ -52,6 +56,12 @@ type Transaction struct {
 	hash atomic.Value
 	size atomic.Value
 	from atomic.Value
+
+	privacyMetadata *PrivacyMetadata
+}
+
+type PrivacyMetadata struct {
+	PrivacyFlag engine.PrivacyFlagType
 }
 
 type txdata struct {
@@ -115,6 +125,16 @@ func newTransaction(nonce uint64, to *common.Address, amount *big.Int, gasLimit 
 	return &Transaction{data: d}
 }
 
+func NewTxPrivacyMetadata(privacyFlag engine.PrivacyFlagType) *PrivacyMetadata {
+	return &PrivacyMetadata{
+		PrivacyFlag: privacyFlag,
+	}
+}
+
+func (tx *Transaction) SetTxPrivacyMetadata(pm *PrivacyMetadata) {
+	tx.privacyMetadata = pm
+}
+
 // ChainId returns which chain id this transaction was signed for (if at all)
 func (tx *Transaction) ChainId() *big.Int {
 	return deriveChainId(tx.data.V)
@@ -131,7 +151,7 @@ func isProtectedV(V *big.Int) bool {
 		// 27 / 28 are pre eip 155 -- ie unprotected.
 		return !(v == 27 || v == 28)
 	}
-	// anything not 27 or 28 are considered unprotected
+	// anything not 27 or 28 is considered protected
 	return true
 }
 
@@ -165,26 +185,32 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 	if err := dec.UnmarshalJSON(input); err != nil {
 		return err
 	}
-	var V byte
-	if isProtectedV(dec.V) {
-		chainID := deriveChainId(dec.V).Uint64()
-		V = byte(dec.V.Uint64() - 35 - 2*chainID)
-	} else {
-		V = byte(dec.V.Uint64() - 27)
+
+	withSignature := dec.V.Sign() != 0 || dec.R.Sign() != 0 || dec.S.Sign() != 0
+	if withSignature {
+		var V byte
+		if isProtectedV(dec.V) {
+			chainID := deriveChainId(dec.V).Uint64()
+			V = byte(dec.V.Uint64() - 35 - 2*chainID)
+		} else {
+			V = byte(dec.V.Uint64() - 27)
+		}
+		if !crypto.ValidateSignatureValues(V, dec.R, dec.S, false) {
+			return ErrInvalidSig
+		}
 	}
-	if !crypto.ValidateSignatureValues(V, dec.R, dec.S, false) {
-		return ErrInvalidSig
-	}
+
 	*tx = Transaction{data: dec}
 	return nil
 }
 
-func (tx *Transaction) Data() []byte       { return common.CopyBytes(tx.data.Payload) }
-func (tx *Transaction) Gas() uint64        { return tx.data.GasLimit }
-func (tx *Transaction) GasPrice() *big.Int { return new(big.Int).Set(tx.data.Price) }
-func (tx *Transaction) Value() *big.Int    { return new(big.Int).Set(tx.data.Amount) }
-func (tx *Transaction) Nonce() uint64      { return tx.data.AccountNonce }
-func (tx *Transaction) CheckNonce() bool   { return true }
+func (tx *Transaction) Data() []byte                      { return common.CopyBytes(tx.data.Payload) }
+func (tx *Transaction) Gas() uint64                       { return tx.data.GasLimit }
+func (tx *Transaction) GasPrice() *big.Int                { return new(big.Int).Set(tx.data.Price) }
+func (tx *Transaction) Value() *big.Int                   { return new(big.Int).Set(tx.data.Amount) }
+func (tx *Transaction) Nonce() uint64                     { return tx.data.AccountNonce }
+func (tx *Transaction) CheckNonce() bool                  { return true }
+func (tx *Transaction) PrivacyMetadata() *PrivacyMetadata { return tx.privacyMetadata }
 
 // To returns the recipient address of the transaction.
 // It returns nil if the transaction is a contract creation.
@@ -194,6 +220,14 @@ func (tx *Transaction) To() *common.Address {
 	}
 	to := *tx.data.Recipient
 	return &to
+}
+
+func (tx *Transaction) From() common.Address {
+	signer := deriveSigner(tx.data.V)
+	if from, err := Sender(signer, tx); err == nil {
+		return from
+	}
+	return common.Address{}
 }
 
 // Hash hashes the RLP encoding of tx.
@@ -242,7 +276,7 @@ func (tx *Transaction) AsMessage(s Signer) (Message, error) {
 }
 
 // WithSignature returns a new transaction with the given signature.
-// This signature needs to be formatted as described in the yellow paper (v+27).
+// This signature needs to be in the [R || S || V] format where V is 0 or 1.
 func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, error) {
 	r, s, v, err := signer.SignatureValues(tx, sig)
 	if err != nil {
@@ -260,7 +294,9 @@ func (tx *Transaction) Cost() *big.Int {
 	return total
 }
 
-func (tx *Transaction) RawSignatureValues() (*big.Int, *big.Int, *big.Int) {
+// RawSignatureValues returns the V, R, S signature values of the transaction.
+// The return values should not be modified by the caller.
+func (tx *Transaction) RawSignatureValues() (v, r, s *big.Int) {
 	return tx.data.V, tx.data.R, tx.data.S
 }
 
@@ -331,9 +367,9 @@ func (s Transactions) GetRlp(i int) []byte {
 	return enc
 }
 
-// TxDifference returns a new set t which is the difference between a to b.
-func TxDifference(a, b Transactions) (keep Transactions) {
-	keep = make(Transactions, 0, len(a))
+// TxDifference returns a new set which is the difference between a and b.
+func TxDifference(a, b Transactions) Transactions {
+	keep := make(Transactions, 0, len(a))
 
 	remove := make(map[common.Hash]struct{})
 	for _, tx := range b {
@@ -396,10 +432,14 @@ func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transa
 	// Initialize a price based heap with the head transactions
 	heads := make(TxByPrice, 0, len(txs))
 	for from, accTxs := range txs {
-		heads = append(heads, accTxs[0])
 		// Ensure the sender address is from the signer
-		acc, _ := Sender(signer, accTxs[0])
-		txs[acc] = accTxs[1:]
+		acc, err := Sender(signer, accTxs[0])
+		if err == nil {
+			heads = append(heads, accTxs[0])
+			txs[acc] = accTxs[1:]
+		} else {
+			log.Info("Failed to recovered sender address, this transaction is skipped", "from", from, "nonce", accTxs[0].data.AccountNonce, "err", err)
+		}
 		if from != acc {
 			delete(txs, from)
 		}
@@ -488,6 +528,14 @@ func (tx *Transaction) IsPrivate() bool {
 	return tx.data.V.Uint64() == 37 || tx.data.V.Uint64() == 38
 }
 
+/*
+ * Indicates that a transaction is private, but doesn't necessarily set the correct v value, as it can be called on
+ * an unsigned transaction.
+ * pre homestead signer, all v values were v=27 or v=28, with EIP155Signer that change,
+ * but SetPrivate() is also used on unsigned transactions to temporarily set the v value to indicate
+ * the transaction is intended to be private, and so that the correct signer can be selected. The signer will correctly
+ * set the valid v value (37 or 38): This helps minimize changes vs upstream go-ethereum code.
+ */
 func (tx *Transaction) SetPrivate() {
 	if tx.IsPrivate() {
 		return
